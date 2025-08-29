@@ -58,7 +58,38 @@ IS_FORCE_PUSH_PR="${IS_FORCE_PUSH_PR:-"false"}"
 IS_KEEP_BRANCH_ON_PR_CLEANUP="${IS_KEEP_BRANCH_ON_PR_CLEANUP:-"false"}"
 GIT_REMOTE_PULL_PARAMS="${GIT_REMOTE_PULL_PARAMS:---allow-unrelated-histories --squash --strategy=recursive -X theirs}"
 
-TEMPLATE_REMOTE_GIT_HASH=$(git ls-remote "${SOURCE_REPO}" HEAD | awk '{print $1}')
+# Tag support: SOURCE_TAG takes precedence over SOURCE_BRANCH
+if [[ -n "${SOURCE_TAG}" ]]; then
+  info "SOURCE_TAG is set: using tag '${SOURCE_TAG}' for sync."
+  SOURCE_REF_TYPE="tag"
+  SOURCE_REF="${SOURCE_TAG}"
+  # Get commit hash for the tag
+  TEMPLATE_REMOTE_GIT_HASH=$(git ls-remote "${SOURCE_REPO}" "refs/tags/${SOURCE_TAG}" | awk '{print $1}')
+  if [[ -z "${TEMPLATE_REMOTE_GIT_HASH}" ]]; then
+    err "Could not find tag '${SOURCE_TAG}' in source repo ${SOURCE_REPO}"
+    exit 1
+  fi
+else
+  # Detect default branch of source repo if SOURCE_BRANCH is not set
+  if [[ -z "${SOURCE_BRANCH}" ]]; then
+    SOURCE_BRANCH=$(git ls-remote --symref "${SOURCE_REPO}" HEAD 2>/dev/null | awk -F'/' '/^ref:/ {print $NF}' | tr -d '\r\n')
+    if [[ -z "${SOURCE_BRANCH}" ]]; then
+      SOURCE_BRANCH="main"
+      info "Could not detect default branch of source repo, falling back to 'main'"
+    else
+      info "Detected default branch of source repo: ${SOURCE_BRANCH}"
+    fi
+  fi
+  SOURCE_REF_TYPE="branch"
+  SOURCE_REF="${SOURCE_BRANCH}"
+  # Use SOURCE_BRANCH to get the correct remote commit hash
+  TEMPLATE_REMOTE_GIT_HASH=$(git ls-remote "${SOURCE_REPO}" "refs/heads/${SOURCE_BRANCH}" | awk '{print $1}')
+  if [[ -z "${TEMPLATE_REMOTE_GIT_HASH}" ]]; then
+    err "Could not find branch '${SOURCE_BRANCH}' in source repo ${SOURCE_REPO}"
+    exit 1
+  fi
+fi
+
 SHORT_TEMPLATE_GIT_HASH=$(git rev-parse --short "${TEMPLATE_REMOTE_GIT_HASH}")
 LOCAL_CURRENT_GIT_HASH=$(git rev-parse HEAD)  # need to be run before a pull to get the current local git hash
 
@@ -66,8 +97,13 @@ info "current git hash: ${LOCAL_CURRENT_GIT_HASH}"
 
 export TEMPLATE_GIT_HASH=${SHORT_TEMPLATE_GIT_HASH}
 export PR_BRANCH="${PR_BRANCH_NAME_PREFIX}_${TEMPLATE_GIT_HASH}"
-: "${PR_BODY:="Merge ${SOURCE_REPO} ${TEMPLATE_GIT_HASH}"}"
-: "${PR_TITLE:-"upstream merge template repository"}"
+if [[ "${SOURCE_REF_TYPE}" == "tag" ]]; then
+  : "${PR_BODY:="Merge ${SOURCE_REPO} tag ${SOURCE_TAG} (${TEMPLATE_GIT_HASH})"}"
+  : "${PR_TITLE:-"upstream merge template repository (tag: ${SOURCE_TAG})"}"
+else
+  : "${PR_BODY:="Merge ${SOURCE_REPO} ${TEMPLATE_GIT_HASH}"}"
+  : "${PR_TITLE:-"upstream merge template repository"}"
+fi
 
 # for some reasons the substitution is not working as expected
 # so we substitute manually
@@ -75,11 +111,15 @@ export PR_BRANCH="${PR_BRANCH_NAME_PREFIX}_${TEMPLATE_GIT_HASH}"
 PR_BODY=${PR_BODY//'${TEMPLATE_GIT_HASH}'/"${TEMPLATE_GIT_HASH}"}
 # shellcheck disable=SC2016
 PR_BODY=${PR_BODY//'${SOURCE_REPO}'/"${SOURCE_REPO}"}
+# shellcheck disable=SC2016
+PR_BODY=${PR_BODY//'${SOURCE_TAG}'/"${SOURCE_TAG}"}
 
 # shellcheck disable=SC2016
 PR_TITLE=${PR_TITLE//'${TEMPLATE_GIT_HASH}'/"${TEMPLATE_GIT_HASH}"}
 # shellcheck disable=SC2016
 PR_TITLE=${PR_TITLE//'${SOURCE_REPO}'/"${SOURCE_REPO}"}
+# shellcheck disable=SC2016
+PR_TITLE=${PR_TITLE//'${SOURCE_TAG}'/"${SOURCE_TAG}"}
 
 debug "TEMPLATE_GIT_HASH ${TEMPLATE_GIT_HASH}"
 debug "PR_BRANCH ${PR_BRANCH}"
@@ -272,7 +312,11 @@ function pull_source_changes() {
   local source_repo=$1
   local git_remote_pull_params=$2
 
-  eval "git pull ${source_repo} --tags ${git_remote_pull_params}" || pull_has_issues=true
+  if [[ "${SOURCE_REF_TYPE}" == "tag" ]]; then
+    eval "git pull ${source_repo} refs/tags/${SOURCE_TAG} --tags ${git_remote_pull_params}" || pull_has_issues=true
+  else
+    eval "git pull ${source_repo} ${SOURCE_BRANCH} --tags ${git_remote_pull_params}" || pull_has_issues=true
+  fi
 
   info "finished pulling from the source."
   info "logging out from source ${SOURCE_REPO_HOSTNAME}."
@@ -492,6 +536,12 @@ function arr_commit() {
   cmd_from_yml "precommit"
 
   echo "::group::commit changes"
+
+  # Only commit if merge commit was not already created by git pull
+  if git log -1 --pretty=%B | grep -q "Merge"; then
+    info "Merge commit already created by git pull, skipping add/commit."
+    return 0
+  fi
 
   git add .
 
